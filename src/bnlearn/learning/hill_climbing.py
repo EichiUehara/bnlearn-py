@@ -10,7 +10,13 @@ from ..utils.graph import arcs2amat, amat2arcs
 try:
     import jax
     import jax.numpy as jnp
-    from ..score.jax_discrete import jax_loglik_discrete, jax_bic_discrete
+    from ..score.api import score_node # Add this if needed by other logic
+    from ..score.jax_discrete import (
+        jax_loglik_discrete, 
+        jax_bic_discrete, 
+        jax_bic_add_batch,
+        BATCH_BUFFER_SIZE
+    )
     HAS_JAX = True
 except ImportError:
     HAS_JAX = False
@@ -76,25 +82,64 @@ class HillClimbing:
                 # This should be cached.
                 
                 # Phase 1: Additions
+                all_add_deltas = {}
+                if self.use_jax and self.score_type == 'bic':
+                    # Batch by v to use JAX efficiently
+                    for v in self.nodes:
+                        candidates = [u for u in self.nodes if u != v and \
+                                     not self._is_blacklisted(u, v, blacklist) and \
+                                     not self._has_arc(current_nw, u, v)]
+                        if candidates:
+                            deltas = self._get_batch_score_add(v, current_nw, candidates)
+                            for i, u in enumerate(candidates):
+                                all_add_deltas[(u, v)] = float(deltas[i])
+                
+                # Search in R order: u then v
                 for u in self.nodes:
                     for v in self.nodes:
                         if u == v: continue
-                        if self._is_blacklisted(u, v, blacklist): continue
-                        if self._has_arc(current_nw, u, v): continue
-                        
-                        # Optimization: Check cycle only if delta is promising? 
-                        # No, we need valid delta. But calculating score is expensive while cycle check is also potentially expensive.
-                        # Usually scoring is more expensive than DFS on small graphs.
-                        # But score computation is cached. Cycle check is not easily cached (depends on whole graph).
-                        
-                        # Let's compute delta first.
-                        delta = self._score_delta(current_nw, u, v, 'add')
+                        d = 0
+                        if (u, v) in all_add_deltas:
+                            d = all_add_deltas[(u, v)]
+                        elif not self._is_blacklisted(u, v, blacklist) and not self._has_arc(current_nw, u, v):
+                            # Fallback if not batched (e.g. non-BIC score)
+                            d = self._score_delta(current_nw, u, v, 'add')
+                        else:
+                            continue
+                            
+                        if d - best_delta > tol:
+                            if not self._creates_cycle(current_nw, u, v):
+                                best_delta = d
+                                best_op = ('add', u, v)
+
+                # Phase 2: Deletions
+                for u in self.nodes:
+                    for v in self.nodes:
+                        if u == v: continue
+                        if self._is_whitelisted(u, v, whitelist): continue
+                        if not self._has_arc(current_nw, u, v): continue
+                            
+                        delta = self._score_delta(current_nw, u, v, 'delete')
                         
                         if delta - best_delta > tol:
-                            # Now check cycle to verify validity
-                            if not self._creates_cycle(current_nw, u, v):
+                            best_delta = delta
+                            best_op = ('delete', u, v)
+
+                # Phase 3: Reversals
+                for u in self.nodes:
+                    for v in self.nodes:
+                        if u == v: continue
+                        if self._is_whitelisted(u, v, whitelist): continue
+                        if self._is_whitelisted(v, u, whitelist): continue
+                        if not self._has_arc(current_nw, u, v): continue
+                        if self._is_blacklisted(v, u, blacklist): continue
+
+                        delta = self._score_delta(current_nw, u, v, 'reverse')
+                        
+                        if delta - best_delta > tol:
+                            if not self._creates_cycle(current_nw, v, u, ignore_arc=(u, v)):
                                 best_delta = delta
-                                best_op = ('add', u, v)
+                                best_op = ('reverse', u, v)
 
                 # Phase 2: Deletions
                 for u in self.nodes:
@@ -149,6 +194,44 @@ class HillClimbing:
                 break
                 
         return best_global_nw
+
+    def _get_batch_score_add(self, v_name, network, candidates):
+        if not self.use_jax or self.score_type != 'bic':
+             # Fallback: manual calculation (should not be called if use_jax is False)
+             return [self._score_delta(network, u, v_name, 'add') for u in candidates]
+
+        v_idx = self.node_to_idx[v_name]
+        v_parents = network.nodes_data[v_name]['parents']
+        current_parent_indices = tuple(sorted([self.node_to_idx[p] for p in v_parents]))
+        
+        # Check if stride is too large for batch buffer
+        current_stride = 1
+        for idx in current_parent_indices:
+            current_stride *= self.jax_cardinalities[idx]
+        
+        node_card = self.jax_cardinalities[v_idx]
+        
+        # Safety check for buffer size
+        max_candidate_card = max([self.jax_cardinalities[self.node_to_idx[u]] for u in candidates])
+        if current_stride * max_candidate_card * node_card > BATCH_BUFFER_SIZE:
+             return [self._score_delta(network, u, v_name, 'add') for u in candidates]
+        
+        candidate_indices = jnp.array([self.node_to_idx[u] for u in candidates])
+        current_node_score = self._get_score_node(v_name, v_parents)
+        
+        batch_scores = jax_bic_add_batch(
+            self.jax_data, 
+            v_idx, 
+            current_parent_indices, 
+            self.jax_cardinalities, 
+            candidate_indices, 
+            self.k_bic
+        )
+        
+        if batch_scores is None:
+             return [self._score_delta(network, u, v_name, 'add') for u in candidates]
+             
+        return np.array(batch_scores) - current_node_score
 
     def _get_score_node(self, node, parents):
         # Sort parents tuple for caching
