@@ -7,6 +7,14 @@ from ..network import BayesianNetwork
 from ..score.api import score_network, score_node
 from ..utils.graph import arcs2amat, amat2arcs
 
+try:
+    import jax
+    import jax.numpy as jnp
+    from ..score.jax_discrete import jax_loglik_discrete, jax_bic_discrete
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
 class HillClimbing:
     def __init__(self, data, score_type='bic', **kwargs):
         self.data = data
@@ -15,6 +23,19 @@ class HillClimbing:
         self.nodes = list(data.columns)
         self.n_nodes = len(self.nodes)
         self.score_cache = {} # (node, tuple(sorted(parents))) -> score
+        
+        # Prepare JAX data if available
+        self.use_jax = HAS_JAX and score_type in ['bic', 'loglik']
+        if self.use_jax:
+            # Ensure categorical and get codes
+            self.jax_data = jnp.array([data[col].cat.codes.values if hasattr(data[col], 'cat') else data[col].values for col in self.nodes]).T
+            self.jax_cardinalities = tuple([
+                len(data[col].cat.categories) if hasattr(data[col], 'cat') else data[col].nunique()
+                for col in self.nodes
+            ])
+            self.node_to_idx = {node: i for i, node in enumerate(self.nodes)}
+            self.n_obs = len(data)
+            self.k_bic = np.log(self.n_obs) / 2.0 if score_type == 'bic' else 0.0
 
     def learn(self, start=None, whitelist=None, blacklist=None, max_iter=float('inf'), restart=0, perturb=1, debug=False):
         
@@ -136,7 +157,20 @@ class HillClimbing:
         if key in self.score_cache:
             return self.score_cache[key]
         
-        val = score_node(node, list(parents_tuple), self.data, self.score_type, **self.kwargs)
+        if self.use_jax:
+            node_idx = self.node_to_idx[node]
+            parent_indices = tuple(sorted([self.node_to_idx[p] for p in parents_tuple]))
+            
+            if self.score_type == 'bic':
+                val = float(jax_bic_discrete(self.jax_data, node_idx, parent_indices, self.jax_cardinalities, self.k_bic))
+            elif self.score_type == 'loglik':
+                val = float(jax_loglik_discrete(self.jax_data, node_idx, parent_indices, self.jax_cardinalities))
+            else:
+                # Fallback for other scores not yet in JAX
+                val = score_node(node, list(parents_tuple), self.data, self.score_type, **self.kwargs)
+        else:
+            val = score_node(node, list(parents_tuple), self.data, self.score_type, **self.kwargs)
+            
         self.score_cache[key] = val
         return val
 
